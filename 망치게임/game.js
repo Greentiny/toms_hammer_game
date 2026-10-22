@@ -44,9 +44,20 @@ const CONFIG = {
   showDebugHud: true,
   /** false면 카메라가 플레이어를 따라감 */
   freeCamera: false,
-  /** 플레이어 표시 스케일 (1024 논리 스프라이트 기준) */
-  playerScale: 0.38,
-  hammerFollowSpeed: 14,
+  /** 플레이어 표시 스케일. 캐릭터·박스·망치가 한 화면에 들어오게 작게 */
+  playerScale: 0.2,
+  /** 손 스프라이트 배율. 양손이 포개져도 손잡이를 덮을 정도 */
+  handScale: 0.5,
+  /**
+   * 팔 굵기. 길이 축은 뼈 길이에 고정하고, 수직 방향만 키운다.
+   * 1이면 에셋 비율 그대로.
+   */
+  armThickness: 1.55,
+  /** 관절 양끝으로 스프라이트를 겹쳐 틈이 보이지 않게 하는 비율 */
+  jointOverlap: 0.2,
+  /** 망치 스프라이트 배율 (그립 위치도 같이 커짐) */
+  hammerScale: 1.32,
+  skin: "rgb(140, 189, 117)",
 };
 
 const canvas = document.getElementById("game-canvas");
@@ -88,36 +99,37 @@ const input = {
 const RIG = {
   originX: 533,
   originY: 978,
-  shoulderL: { x: 410, y: 475 },
-  shoulderR: { x: 630, y: 455 },
-  /** 몸 기준 망치 회전축 (양손 사이) */
-  hammerPivot: { x: 520, y: 560 },
+  /** 상체 좌우. 팔이 서로 겹쳐 한 팔처럼 보이지 않게 벌린다. */
+  shoulderL: { x: 450, y: 425 },
+  shoulderR: { x: 605, y: 415 },
+  /** 도끼가 몸을 중심으로 도는 기준점. 손은 여기 고정되지 않는다. */
+  hammerPivot: { x: 524, y: 470 },
   /**
-   * 망치 이미지 로컬 좌표
-   * 손잡이 세로, 돌머리가 위쪽
+   * 망치 이미지 로컬 좌표 (1024). 나무 손잡이는 대략 y 300–870.
+   * 회전축은 자루 끝이라 손이 몸에서 멀리 나가고, 팔이 그곳까지 뻗는다.
+   * 양손 그립은 나무 손잡이 길이의 한가운데.
    */
   hammer: {
-    pivotX: 505,
-    pivotY: 640,
-    headX: 505,
-    headY: 140,
-    gripUpper: { x: 505, y: 560 },
-    gripLower: { x: 505, y: 700 },
+    pivotX: 608,
+    pivotY: 850,
+    headX: 488,
+    headY: 128,
+    gripFront: { x: 576, y: 568 },
+    gripBack: { x: 580, y: 604 },
   },
-  parts: {
-    // 2048 캔버스 기준 opaque bounds (교체 에셋 재측정)
-    leftArm2: { x: 985, y: 723, w: 368, h: 378, naturalAngle: -0.7 },
-    leftArm1: { x: 697, y: 1006, w: 392, h: 311, naturalAngle: -0.55 },
-    leftHand: { x: 554, y: 1200, w: 224, h: 251, naturalAngle: -0.9 },
-    rightArm2: { x: 985, y: 723, w: 368, h: 378, naturalAngle: 0.7 },
-    rightArm1: { x: 697, y: 1006, w: 392, h: 311, naturalAngle: 0.55 },
-    rightHand: { x: 554, y: 1200, w: 224, h: 251, naturalAngle: 0.9 },
+  /**
+   * 2048 에셋에서 측정한 팔 중심선 양끝.
+   * 오른쪽 이미지는 왼쪽과 동일한 파일이라 같은 앵커를 쓴다.
+   */
+  limbs: {
+    upper: { ax: 1037, ay: 1059, bx: 1310, by: 779, radius: 64 },
+    lower: { ax: 746, ay: 1277, bx: 1045, by: 1053, radius: 62 },
+    hand: { palmX: 663, palmY: 1313, axis: -1.103 },
   },
+  /** 스프라이트 픽셀 기준 뼈 길이. 화면에서는 player.scale 을 곱함 */
   armLen: {
-    leftUpper: 130,
-    leftLower: 125,
-    rightUpper: 130,
-    rightLower: 125,
+    upper: 270,
+    lower: 250,
   },
 };
 
@@ -125,9 +137,20 @@ const player = {
   x: 0,
   y: 0,
   scale: CONFIG.playerScale,
-  /** 망치 각도 (캔버스 기준, 0=오른쪽, 시계방향+) */
-  hammerAngle: -Math.PI / 2,
-  targetHammerAngle: -Math.PI / 2,
+  /**
+   * 망치 각도 (캔버스, Y-down, 시계방향+)
+   * 0 = 돌머리가 위, PI/2 = 오른쪽, PI = 아래
+   */
+  hammerAngle: 0,
+  targetHammerAngle: 0,
+  /** 어깨 중앙에서 손잡이까지의 거리. 마우스가 멀수록 커진다. */
+  aim: -Math.PI / 2,
+  gripDist: 90,
+  /** 이전 프레임 팔꿈치. 꺾임 방향이 갑자기 뒤집히지 않게 유지 */
+  arms: {
+    left: null,
+    right: null,
+  },
 };
 
 let gameState = GameState.PLAYING;
@@ -233,8 +256,13 @@ function spawnPlayer() {
   player.x = world.width * 0.5;
   // 박스 바닥이 화면 하단에서 조금 위
   player.y = world.height - Math.min(120, vh * 0.12);
-  player.hammerAngle = -Math.PI / 2;
-  player.targetHammerAngle = -Math.PI / 2;
+  const reach = armReachProfile();
+  player.aim = -Math.PI / 2;
+  player.gripDist = reach.extendDist;
+  player.hammerAngle = player.aim - hammerHeadFromGripAngle();
+  player.targetHammerAngle = player.hammerAngle;
+  player.arms.left = null;
+  player.arms.right = null;
 }
 
 function drawBackground() {
@@ -257,51 +285,140 @@ function drawBackground() {
 // 플레이어: IK / 망치 / 렌더
 // ---------------------------------------------------------------------------
 
-function solveTwoBone(ax, ay, tx, ty, len1, len2, bendDir) {
+function bendSignOf(ax, ay, hx, hy, ex, ey) {
+  const cross = (hx - ax) * (ey - ay) - (hy - ay) * (ex - ax);
+  return cross >= 0 ? 1 : -1;
+}
+
+/**
+ * 2본 IK. 상완/하완 길이는 고정하고, 닿지 않으면 손목만 어깨 방향으로 당긴다.
+ * 팔꿈치는 두 해 중 이전 프레임과 더 가까운 쪽을 골라 뒤집힘을 막는다.
+ */
+function solveTwoBone(ax, ay, tx, ty, len1, len2, prev, preferredBend = 1) {
   const dx = tx - ax;
   const dy = ty - ay;
-  let dist = Math.hypot(dx, dy);
-  const maxReach = len1 + len2 - 0.5;
-  const minReach = Math.abs(len1 - len2) + 0.5;
-  if (dist > maxReach) dist = maxReach;
-  if (dist < minReach) dist = minReach;
-
-  const ux = dx / (Math.hypot(dx, dy) || 1);
-  const uy = dy / (Math.hypot(dx, dy) || 1);
-  const clampedX = ax + ux * dist;
-  const clampedY = ay + uy * dist;
+  const raw = Math.hypot(dx, dy) || 1;
+  const maxReach = len1 + len2 - 0.01;
+  const minReach = Math.abs(len1 - len2) + 0.01;
+  const dist = clamp(raw, minReach, maxReach);
+  const handX = ax + (dx / raw) * dist;
+  const handY = ay + (dy / raw) * dist;
 
   const cosA = clamp(
     (len1 * len1 + dist * dist - len2 * len2) / (2 * len1 * dist),
     -1,
     1
   );
-  const angleOffset = Math.acos(cosA) * bendDir;
-  const base = Math.atan2(clampedY - ay, clampedX - ax);
-  const elbowAngle = base + angleOffset;
+  const offset = Math.acos(cosA);
+  const base = Math.atan2(handY - ay, handX - ax);
 
+  const candidates = [1, -1].map((dir) => {
+    const elbowAngle = base + offset * dir;
+    const elbowX = ax + Math.cos(elbowAngle) * len1;
+    const elbowY = ay + Math.sin(elbowAngle) * len1;
+    return {
+      elbowX,
+      elbowY,
+      handX,
+      handY,
+      bend: bendSignOf(ax, ay, handX, handY, elbowX, elbowY),
+    };
+  });
+
+  if (prev && Number.isFinite(prev.elbowX)) {
+    const dist2 = (pose) => {
+      const ex = pose.elbowX - prev.elbowX;
+      const ey = pose.elbowY - prev.elbowY;
+      return ex * ex + ey * ey;
+    };
+    const d0 = dist2(candidates[0]);
+    const d1 = dist2(candidates[1]);
+    if (Math.abs(d0 - d1) < 4 && prev.bend) {
+      const same = candidates.find((pose) => pose.bend === prev.bend);
+      if (same) return same;
+    }
+    return d0 <= d1 ? candidates[0] : candidates[1];
+  }
+
+  const preferred = prev && prev.bend ? prev.bend : preferredBend;
+  return candidates.find((pose) => pose.bend === preferred) || candidates[0];
+}
+
+/** 이미지에서 손잡이 중심 → 도끼 머리 방향 */
+function hammerGripLocal() {
+  const H = RIG.hammer;
   return {
-    elbowX: ax + Math.cos(elbowAngle) * len1,
-    elbowY: ay + Math.sin(elbowAngle) * len1,
-    handX: clampedX,
-    handY: clampedY,
+    x: (H.gripFront.x + H.gripBack.x) / 2,
+    y: (H.gripFront.y + H.gripBack.y) / 2,
   };
 }
 
-function getHammerPose() {
-  const pivot = spriteToWorld(RIG.hammerPivot.x, RIG.hammerPivot.y);
-  const angle = player.hammerAngle;
-  const s = player.scale;
+function hammerHeadFromGripAngle() {
   const H = RIG.hammer;
+  const grip = hammerGripLocal();
+  return Math.atan2(H.headY - grip.y, H.headX - grip.x);
+}
+
+function shoulderMidpoint() {
+  const left = spriteToWorld(RIG.shoulderL.x, RIG.shoulderL.y);
+  const right = spriteToWorld(RIG.shoulderR.x, RIG.shoulderR.y);
+  return {
+    x: (left.x + right.x) / 2,
+    y: (left.y + right.y) / 2,
+    sep: Math.hypot(right.x - left.x, right.y - left.y),
+  };
+}
+
+/** 팔 길이로 정한, 어깨 중앙 기준 손잡이 거리 */
+function armReachProfile() {
+  const upper = RIG.armLen.upper * player.scale;
+  const lower = RIG.armLen.lower * player.scale;
+  const maxReach = upper + lower;
+  const half = shoulderMidpoint().sep / 2;
+  const toMid = (shoulderDist) =>
+    Math.sqrt(Math.max(shoulderDist * shoulderDist - half * half, 1));
+  return {
+    upper,
+    lower,
+    maxReach,
+    /** 거의 180도로 편 상태 */
+    extendDist: toMid(maxReach * 0.9995),
+    /** 팔꿈치가 분명히 접히는 상태 */
+    flexDist: toMid(maxReach * 0.5),
+  };
+}
+
+function smoothstep(t) {
+  const x = clamp(t, 0, 1);
+  return x * x * (3 - 2 * x);
+}
+
+function getHammerPose() {
+  const mid = shoulderMidpoint();
+  const angle = player.hammerAngle;
+  const aim = player.aim;
+  const s = player.scale * CONFIG.hammerScale;
+  const H = RIG.hammer;
+  const grip = hammerGripLocal();
+  const dx = (grip.x - H.pivotX) * s;
+  const dy = (grip.y - H.pivotY) * s;
+  const c = Math.cos(angle);
+  const sn = Math.sin(angle);
+  const rx = dx * c - dy * sn;
+  const ry = dx * sn + dy * c;
+  const dist = player.gripDist;
+  const target = {
+    x: mid.x + Math.cos(aim) * dist,
+    y: mid.y + Math.sin(aim) * dist,
+  };
+  const pivot = { x: target.x - rx, y: target.y - ry };
 
   const localToWorld = (lx, ly) => {
-    const dx = (lx - H.pivotX) * s;
-    const dy = (ly - H.pivotY) * s;
-    const c = Math.cos(angle);
-    const sn = Math.sin(angle);
+    const ox = (lx - H.pivotX) * s;
+    const oy = (ly - H.pivotY) * s;
     return {
-      x: pivot.x + dx * c - dy * sn,
-      y: pivot.y + dx * sn + dy * c,
+      x: pivot.x + ox * c - oy * sn,
+      y: pivot.y + ox * sn + oy * c,
     };
   };
 
@@ -309,24 +426,65 @@ function getHammerPose() {
     pivot,
     angle,
     head: localToWorld(H.headX, H.headY),
-    gripUpper: localToWorld(H.gripUpper.x, H.gripUpper.y),
-    gripLower: localToWorld(H.gripLower.x, H.gripLower.y),
+    gripFront: localToWorld(H.gripFront.x, H.gripFront.y),
+    gripBack: localToWorld(H.gripBack.x, H.gripBack.y),
   };
 }
 
-function updateHammer(dt) {
+function solveArms(pose) {
+  const shoulderL = spriteToWorld(RIG.shoulderL.x, RIG.shoulderL.y);
+  const shoulderR = spriteToWorld(RIG.shoulderR.x, RIG.shoulderR.y);
+  const upper = RIG.armLen.upper * player.scale;
+  const lower = RIG.armLen.lower * player.scale;
+
+  const left = solveTwoBone(
+    shoulderL.x,
+    shoulderL.y,
+    pose.gripFront.x,
+    pose.gripFront.y,
+    upper,
+    lower,
+    player.arms.left,
+    1
+  );
+  const right = solveTwoBone(
+    shoulderR.x,
+    shoulderR.y,
+    pose.gripBack.x,
+    pose.gripBack.y,
+    upper,
+    lower,
+    player.arms.right,
+    -1
+  );
+
+  player.arms.left = left;
+  player.arms.right = right;
+
+  return {
+    shoulderL,
+    shoulderR,
+    left,
+    right,
+  };
+}
+
+function updateHammer() {
   if (!input.mouseInView) return;
 
-  const pivot = spriteToWorld(RIG.hammerPivot.x, RIG.hammerPivot.y);
+  const mid = shoulderMidpoint();
   const mouse = screenToWorld(input.mouseX, input.mouseY);
-  player.targetHammerAngle = Math.atan2(mouse.y - pivot.y, mouse.x - pivot.x);
+  const aim = Math.atan2(mouse.y - mid.y, mouse.x - mid.x);
+  const mouseDist = Math.hypot(mouse.x - mid.x, mouse.y - mid.y);
+  const reach = armReachProfile();
+  const t = smoothstep(
+    (mouseDist - reach.flexDist) / (reach.extendDist - reach.flexDist)
+  );
 
-  // 최단 각 보간
-  let diff = player.targetHammerAngle - player.hammerAngle;
-  while (diff > Math.PI) diff -= Math.PI * 2;
-  while (diff < -Math.PI) diff += Math.PI * 2;
-  const t = 1 - Math.exp(-CONFIG.hammerFollowSpeed * dt);
-  player.hammerAngle += diff * t;
+  player.aim = aim;
+  player.gripDist = reach.flexDist + (reach.extendDist - reach.flexDist) * t;
+  player.targetHammerAngle = aim - hammerHeadFromGripAngle();
+  player.hammerAngle = player.targetHammerAngle;
 }
 
 /**
@@ -349,53 +507,75 @@ function drawSpriteLayer(key) {
   ctx.drawImage(img, 0, 0, SPRITE, SPRITE);
 }
 
-function drawBoneSegment(img, part, ax, ay, bx, by) {
+/**
+ * 팔 스프라이트의 양끝 앵커를 관절 좌표에 정확히 올린다.
+ * 길이 축은 뼈 길이(+겹침)에 맞추고, 굵기만 armThickness 로 키운다.
+ */
+function drawLimb(img, spec, ax, ay, bx, by) {
   if (!img) return;
-  const mx = (ax + bx) / 2;
-  const my = (ay + by) / 2;
-  const boneLen = Math.hypot(bx - ax, by - ay) || 1;
-  const boneAngle = Math.atan2(by - ay, bx - ax);
-  const nativeLen = Math.max(part.w, part.h);
+  const dx = bx - ax;
+  const dy = by - ay;
+  const boneLen = Math.hypot(dx, dy) || 1;
+  const boneAngle = Math.atan2(dy, dx);
+  const sx = spec.bx - spec.ax;
+  const sy = spec.by - spec.ay;
+  const srcLen = Math.hypot(sx, sy) || 1;
+  const srcAngle = Math.atan2(sy, sx);
+  const overlap = boneLen * CONFIG.jointOverlap;
+  const along = (boneLen + overlap) / srcLen;
+  const thick = along * CONFIG.armThickness;
+  const ux = dx / boneLen;
+  const uy = dy / boneLen;
 
   ctx.save();
-  ctx.translate(mx, my);
-  ctx.rotate(boneAngle - part.naturalAngle);
-  const scale = boneLen / nativeLen;
-  ctx.scale(scale, scale);
-  ctx.drawImage(
-    img,
-    part.x,
-    part.y,
-    part.w,
-    part.h,
-    -part.w / 2,
-    -part.h / 2,
-    part.w,
-    part.h
-  );
+  ctx.translate(ax - ux * (overlap / 2), ay - uy * (overlap / 2));
+  ctx.rotate(boneAngle);
+  ctx.scale(along, thick);
+  ctx.rotate(-srcAngle);
+  ctx.translate(-spec.ax, -spec.ay);
+  ctx.drawImage(img, 0, 0);
   ctx.restore();
 }
 
-function drawHandOnGrip(img, part, grip, hammerAngle, flipHint) {
+function drawJoint(x, y, radius) {
+  const screen = worldToScreen(x, y);
+  ctx.beginPath();
+  ctx.fillStyle = CONFIG.skin;
+  ctx.arc(screen.x, screen.y, Math.max(radius, 1), 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function jointRadius(boneLen, spec) {
+  const srcLen = Math.hypot(spec.bx - spec.ax, spec.by - spec.ay) || 1;
+  return boneLen * (spec.radius / srcLen) * CONFIG.armThickness * 0.92;
+}
+
+function drawArm(imgUpper, imgLower, shoulder, elbow, wrist) {
+  const upperLen = Math.hypot(elbow.x - shoulder.x, elbow.y - shoulder.y);
+  const lowerLen = Math.hypot(wrist.x - elbow.x, wrist.y - elbow.y);
+  const a = worldToScreen(shoulder.x, shoulder.y);
+  const e = worldToScreen(elbow.x, elbow.y);
+  const w = worldToScreen(wrist.x, wrist.y);
+
+  drawJoint(shoulder.x, shoulder.y, jointRadius(upperLen, RIG.limbs.upper) * 0.85);
+  drawLimb(imgUpper, RIG.limbs.upper, a.x, a.y, e.x, e.y);
+  drawJoint(elbow.x, elbow.y, jointRadius(upperLen, RIG.limbs.upper));
+  drawLimb(imgLower, RIG.limbs.lower, e.x, e.y, w.x, w.y);
+  drawJoint(wrist.x, wrist.y, jointRadius(lowerLen, RIG.limbs.lower) * 0.8);
+}
+
+function drawHandOnGrip(img, grip, hammerAngle, mirror) {
   if (!img) return;
+  const spec = RIG.limbs.hand;
   const screen = worldToScreen(grip.x, grip.y);
-  const handAngle = hammerAngle + flipHint;
+  const s = player.scale * CONFIG.handScale;
 
   ctx.save();
   ctx.translate(screen.x, screen.y);
-  ctx.rotate(handAngle - part.naturalAngle);
-  ctx.scale(player.scale, player.scale);
-  ctx.drawImage(
-    img,
-    part.x,
-    part.y,
-    part.w,
-    part.h,
-    -part.w / 2,
-    -part.h / 2,
-    part.w,
-    part.h
-  );
+  ctx.rotate(hammerAngle - spec.axis);
+  ctx.scale(mirror ? -s : s, s);
+  ctx.translate(-spec.palmX, -spec.palmY);
+  ctx.drawImage(img, 0, 0);
   ctx.restore();
 }
 
@@ -408,106 +588,40 @@ function drawHammer(pose) {
   ctx.save();
   ctx.translate(screen.x, screen.y);
   ctx.rotate(pose.angle);
-  ctx.scale(player.scale, player.scale);
+  ctx.scale(
+    player.scale * CONFIG.hammerScale,
+    player.scale * CONFIG.hammerScale
+  );
   ctx.drawImage(img, -H.pivotX, -H.pivotY, SPRITE, SPRITE);
   ctx.restore();
 }
 
 function drawPlayer() {
   const pose = getHammerPose();
-  const shoulderL = spriteToWorld(RIG.shoulderL.x, RIG.shoulderL.y);
-  const shoulderR = spriteToWorld(RIG.shoulderR.x, RIG.shoulderR.y);
+  const arms = solveArms(pose);
+  const leftElbow = { x: arms.left.elbowX, y: arms.left.elbowY };
+  const rightElbow = { x: arms.right.elbowX, y: arms.right.elbowY };
+  const leftWrist = { x: arms.left.handX, y: arms.left.handY };
+  const rightWrist = { x: arms.right.handX, y: arms.right.handY };
 
-  // 왼팔: 어깨 → 위쪽 그립, 오른팔: 어깨 → 아래쪽 그립
-  const left = solveTwoBone(
-    shoulderL.x,
-    shoulderL.y,
-    pose.gripUpper.x,
-    pose.gripUpper.y,
-    RIG.armLen.leftUpper * player.scale,
-    RIG.armLen.leftLower * player.scale,
-    1
-  );
-  const right = solveTwoBone(
-    shoulderR.x,
-    shoulderR.y,
-    pose.gripLower.x,
-    pose.gripLower.y,
-    RIG.armLen.rightUpper * player.scale,
-    RIG.armLen.rightLower * player.scale,
-    -1
-  );
+  // 왼팔은 가장 뒤. 몸통·얼굴과 겹치면 그 아래로 가려진다.
+  drawArm(images.leftArm2, images.leftArm1, arms.shoulderL, leftElbow, leftWrist);
 
-  // 1) 뒤쪽 파츠
+  // 꼬리 → 몸통 → 박스(몸통 아래를 가림) → 머리
   withPlayerTransform(() => {
     drawSpriteLayer("tail");
-    drawSpriteLayer("box");
     drawSpriteLayer("body");
+    drawSpriteLayer("box");
     drawSpriteLayer("head");
   });
 
-  // 2) 팔 (월드 좌표 뼈대)
-  const toScreenBone = (ax, ay, bx, by, imgKey, partKey) => {
-    const a = worldToScreen(ax, ay);
-    const b = worldToScreen(bx, by);
-    // drawBoneSegment는 이미 스크린 픽셀 기준이므로 scale 보정:
-    // shoulder/hand는 월드 좌표 → 스크린은 카메라만 빼므로 거리는 월드=스크린 스케일 동일
-    drawBoneSegment(images[imgKey], RIG.parts[partKey], a.x, a.y, b.x, b.y);
-  };
+  drawArm(images.rightArm2, images.rightArm1, arms.shoulderR, rightElbow, rightWrist);
 
-  // 뼈 길이가 player.scale 반영된 월드 단위라, 스크린에서도 동일
-  // 다만 drawBoneSegment가 part 픽셀을 scale로 맞추므로, 스크린 상의 뼈 길이를 그대로 사용
-  toScreenBone(
-    shoulderL.x,
-    shoulderL.y,
-    left.elbowX,
-    left.elbowY,
-    "leftArm2",
-    "leftArm2"
-  );
-  toScreenBone(
-    left.elbowX,
-    left.elbowY,
-    left.handX,
-    left.handY,
-    "leftArm1",
-    "leftArm1"
-  );
-  toScreenBone(
-    shoulderR.x,
-    shoulderR.y,
-    right.elbowX,
-    right.elbowY,
-    "rightArm2",
-    "rightArm2"
-  );
-  toScreenBone(
-    right.elbowX,
-    right.elbowY,
-    right.handX,
-    right.handY,
-    "rightArm1",
-    "rightArm1"
-  );
-
-  // 3) 망치 (손 아래/사이)
   drawHammer(pose);
 
-  // 4) 손 — 망치 그립에 부착
-  drawHandOnGrip(
-    images.leftHand,
-    RIG.parts.leftHand,
-    pose.gripUpper,
-    pose.angle,
-    0.15
-  );
-  drawHandOnGrip(
-    images.rightHand,
-    RIG.parts.rightHand,
-    pose.gripLower,
-    pose.angle,
-    -0.15
-  );
+  // 손은 도끼보다 위. 손잡이와 겹쳐도 손이 앞에 보인다.
+  drawHandOnGrip(images.rightHand, rightWrist, pose.angle, true);
+  drawHandOnGrip(images.leftHand, leftWrist, pose.angle, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +802,7 @@ function updateDebugHud() {
     `state: ${gameState}`,
     `player: (${Math.round(player.x)}, ${Math.round(player.y)})`,
     `hammer: ${deg}°`,
-    `grip: (${Math.round(pose.gripUpper.x)}, ${Math.round(pose.gripUpper.y)})`,
+    `grip: (${Math.round(pose.gripFront.x)}, ${Math.round(pose.gripFront.y)})`,
     `camera: ${CONFIG.freeCamera ? "FREE (C to follow)" : "FOLLOW (C to free)"}`,
     `mouse: aim hammer`,
   ].join("\n");
